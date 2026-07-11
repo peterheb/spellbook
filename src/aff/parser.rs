@@ -1185,8 +1185,11 @@ fn decode_flagset(
     flag_type: FlagType,
     aliases: &[FlagSet],
 ) -> core::result::Result<FlagSet, ParseFlagError> {
-    // Fast lane for numeric flag-types and empty aliases.
-    if matches!(flag_type, FlagType::Numeric) || aliases.is_empty() {
+    // Fast lane when there are no flag aliases. An `AF` alias table takes
+    // priority over the flag type: a flagset field is decoded as a 1-based alias
+    // index even under `FLAG num`. Hunspell:
+    // <https://github.com/hunspell/hunspell/blob/2969be996acad84b91ab3875b1816636fe61a40e/src/hunspell/hashmgr.cxx#L652-L660>
+    if aliases.is_empty() {
         return parse_flags_from_str(flag_type, input);
     }
 
@@ -1851,33 +1854,56 @@ mod test {
 
     #[test]
     fn decode_flagset_test() {
-        let aliases = &[flagset![1], flagset![2], flagset![3, 4]];
+        // Alias values differ from their indices so resolving an index is
+        // distinguishable from decoding a literal flag.
+        let aliases = &[flagset![100], flagset![200, 300]];
 
+        // With an alias table a flagset field is a 1-based alias index.
         // NOTE: 1-indexing.
         assert_eq!(
-            flagset![1],
+            flagset![100],
             decode_flagset("1", FlagType::default(), aliases).unwrap()
         );
         assert_eq!(
-            flagset![2],
+            flagset![200, 300],
             decode_flagset("2", FlagType::default(), aliases).unwrap()
         );
+
+        // The alias table takes priority over the flag type: `FLAG num` resolves
+        // the index rather than decoding the literal flag {1}.
         assert_eq!(
-            flagset![3, 4],
+            flagset![100],
+            decode_flagset("1", FlagType::Numeric, aliases).unwrap()
+        );
+        assert_eq!(
+            flagset![200, 300],
+            decode_flagset("2", FlagType::Numeric, aliases).unwrap()
+        );
+
+        // An out-of-range index falls back to decoding a literal flag.
+        assert_eq!(
+            flagset!['3' as u16],
             decode_flagset("3", FlagType::default(), aliases).unwrap()
         );
+        assert_eq!(
+            flagset![3],
+            decode_flagset("3", FlagType::Numeric, aliases).unwrap()
+        );
+
+        // A non-integer field can't be an index, so it's decoded literally.
         assert_eq!(
             flagset!['a' as u16],
             decode_flagset("a", FlagType::default(), aliases).unwrap()
         );
 
-        assert_eq!(
-            flagset![1],
-            decode_flagset("1", FlagType::Numeric, aliases).unwrap()
-        );
+        // Without an alias table the field is always decoded literally.
         assert_eq!(
             flagset!['1' as u16],
             decode_flagset("1", FlagType::default(), &[]).unwrap()
+        );
+        assert_eq!(
+            flagset![1],
+            decode_flagset("1", FlagType::Numeric, &[]).unwrap()
         );
     }
 

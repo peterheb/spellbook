@@ -27,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SIMPLIFIEDTRIPLE`).
 * `NOSPLITSUGS` is now honored: the suggester no longer proposes splitting a word
   into two when the dictionary sets this flag.
+* Fixed flag decoding for dictionaries that combine `FLAG num` with an `AF`
+  alias table. A flag field is now resolved as an alias index rather than
+  decoded as a literal numeric flag, so alias references expand correctly
+  (matching Hunspell and Nuspell). Previously affected dictionaries such as
+  Korean, whose suffix rules are referenced through `AF` aliases, reported
+  every suffixed word as misspelled.
 
 ### Performance
 
