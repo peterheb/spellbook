@@ -1272,6 +1272,20 @@ impl CaseHandling {
         }
     }
 
+    /// Like [`Self::lowercase`] but reuses `buf`'s allocation for the output.
+    ///
+    /// ASCII words with `Standard` case handling are lowercased without allocating. Other
+    /// inputs fall back to [`Self::lowercase`] and still allocate.
+    pub fn lowercase_into(&self, word: &str, buf: &mut String) {
+        buf.clear();
+        if matches!(self, Self::Standard) && word.is_ascii() {
+            buf.push_str(word);
+            buf.make_ascii_lowercase();
+        } else {
+            buf.push_str(&self.lowercase(word));
+        }
+    }
+
     pub fn uppercase(&self, word: &str) -> String {
         match self {
             Self::Turkic => word.replace('i', "İ").replace('ı', "I").to_uppercase(),

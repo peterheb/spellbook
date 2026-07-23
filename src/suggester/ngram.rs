@@ -77,6 +77,7 @@ impl<S: BuildHasher> Suggester<'_, S> {
         // Overallocate so we probably don't need to reallocate in the loop:
         let mut stem_buf = Vec::with_capacity(word.len_chars() * 2);
         let mut lowercase_stem_buf = Vec::with_capacity(stem_buf.len());
+        let mut lowercase_buf = String::new();
         let mut roots = BinaryHeap::with_capacity(100);
         for entry @ (stem, flagset) in self.checker.words.iter() {
             if flagset.contains(&self.checker.aff.options.forbidden_word_flag)
@@ -91,15 +92,12 @@ impl<S: BuildHasher> Suggester<'_, S> {
                 left_common_substring_length(&self.checker.aff.options.case_handling, word, stem)
                     as isize;
 
-            // TODO: lowercase into buf so we can reuse this allocation? It would mean copying a
-            // lot of code from the standard library unfortunately.
-            let lowercase_stem = self
-                .checker
+            self.checker
                 .aff
                 .options
                 .case_handling
-                .lowercase(stem.as_str());
-            let lowercase_stem = CharsStr::new(lowercase_stem.as_str(), &mut lowercase_stem_buf);
+                .lowercase_into(stem.as_str(), &mut lowercase_buf);
+            let lowercase_stem = CharsStr::new(&lowercase_buf, &mut lowercase_stem_buf);
             score += ngram_similarity_longer_worse(3, word, lowercase_stem);
 
             let root = MinScored {
@@ -164,14 +162,12 @@ impl<S: BuildHasher> Suggester<'_, S> {
                     CharsStr::new(&expanded_word, &mut expanded_word_buf),
                 ) as isize;
 
-                let lower_expanded_word = self
-                    .checker
+                self.checker
                     .aff
                     .options
                     .case_handling
-                    .lowercase(&expanded_word);
-                score +=
-                    ngram_similarity_any_mismatch(word.len_chars(), word, &lower_expanded_word);
+                    .lowercase_into(&expanded_word, &mut lowercase_buf);
+                score += ngram_similarity_any_mismatch(word.len_chars(), word, &lowercase_buf);
 
                 if score < threshold {
                     continue;
@@ -209,8 +205,12 @@ impl<S: BuildHasher> Suggester<'_, S> {
             inner: guess_word,
         } in guess_words.iter_mut()
         {
-            let lower_guess_word = self.checker.aff.options.case_handling.lowercase(guess_word);
-            let lower_guess_word = CharsStr::new(&lower_guess_word, &mut lower_guess_word_buf);
+            self.checker
+                .aff
+                .options
+                .case_handling
+                .lowercase_into(guess_word, &mut lowercase_buf);
+            let lower_guess_word = CharsStr::new(&lowercase_buf, &mut lower_guess_word_buf);
 
             let lcs = longest_common_subsequence_length(word, lower_guess_word, &mut lcs_state);
 
@@ -526,6 +526,12 @@ impl<'s, 'i> CharsStr<'s, 'i> {
         self.inner
     }
 
+    /// Whether the string is entirely ASCII, in O(1): a string is ASCII exactly when it has as
+    /// many chars as bytes, and the char count is precomputed.
+    const fn is_ascii(&self) -> bool {
+        self.len_chars() == self.inner.len()
+    }
+
     /// Returns a `&str` subslice containing all of the characters in the given _character_ range.
     ///
     /// Note that this method takes character indices and not byte indices.
@@ -607,6 +613,21 @@ fn ngram_similarity_longer_worse(n: usize, left: CharsStr, right: CharsStr) -> i
 
 // Nuspell calls this `ngram_similarity_low_level`.
 fn ngram_similarity(n: usize, left: CharsStr, right: &str) -> isize {
+    // Fast path: for ASCII inputs chars == bytes, so k-gram containment can be
+    // checked with plain byte-window comparisons, avoiding the per-call setup
+    // cost of `str::contains`'s generic substring searcher. Counting semantics
+    // are identical to the generic path. `right`'s ASCII check is folded into
+    // the presence-table build in `ngram_similarity_ascii` so `right` is only
+    // walked once.
+    if left.is_ascii() {
+        if let Some(score) = ngram_similarity_ascii(n, left.as_str().as_bytes(), right.as_bytes()) {
+            return score;
+        }
+    }
+    ngram_similarity_generic(n, left, right)
+}
+
+fn ngram_similarity_generic(n: usize, left: CharsStr, right: &str) -> isize {
     let n = n.min(left.len_chars());
     let mut score = 0;
 
@@ -625,6 +646,49 @@ fn ngram_similarity(n: usize, left: CharsStr, right: &str) -> isize {
     }
 
     score
+}
+
+/// ASCII-only equivalent of `ngram_similarity_generic`. `left` must be ASCII;
+/// returns `None` if `right` turns out not to be, in which case the caller
+/// falls back to the generic path.
+fn ngram_similarity_ascii(n: usize, left: &[u8], right: &[u8]) -> Option<isize> {
+    let n = n.min(left.len());
+    let mut score = 0;
+    // k == 1: a 256-slot presence table answers "does `right` contain this
+    // byte" in O(1) per position of `left`. Building it visits every byte of
+    // `right`, which doubles as `right`'s ASCII check.
+    if n >= 1 {
+        let mut present = [false; 256];
+        for &b in right {
+            if !b.is_ascii() {
+                return None;
+            }
+            present[b as usize] = true;
+        }
+        let mut k_score = 0;
+        for &b in left {
+            if present[b as usize] {
+                k_score += 1;
+            }
+        }
+        score += k_score;
+        if k_score < 2 {
+            return Some(score);
+        }
+    }
+    for k in 2..=n {
+        let mut k_score = 0;
+        for needle in left.windows(k) {
+            if right.windows(k).any(|w| w == needle) {
+                k_score += 1;
+            }
+        }
+        score += k_score;
+        if k_score < 2 {
+            break;
+        }
+    }
+    Some(score)
 }
 
 fn ngram_similarity_any_mismatch(n: usize, left: CharsStr, right: &str) -> isize {
@@ -792,5 +856,45 @@ mod test {
             ),
             (2, true)
         );
+    }
+}
+
+#[cfg(test)]
+mod ascii_equivalence {
+    use super::*;
+
+    #[test]
+    fn ascii_path_matches_generic() {
+        // Deterministic xorshift RNG over a small alphabet: repeated k-grams are common, so the
+        // `k_score < 2` early exit is exercised both ways.
+        let mut state = 0x2545F4914F6CDD1Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let alphabet = [b'a', b'b', b'c', b'd', b'e'];
+        let mut slab = Vec::new();
+        for _case in 0..20_000 {
+            let left_len = (next() % 13) as usize;
+            let right_len = (next() % 13) as usize;
+            let left: String = (0..left_len)
+                .map(|_| alphabet[(next() % 5) as usize] as char)
+                .collect();
+            let right: String = (0..right_len)
+                .map(|_| alphabet[(next() % 5) as usize] as char)
+                .collect();
+            let left_cs = CharsStr::new(&left, &mut slab);
+            for n in [1usize, 2, 3, left_len.max(1)] {
+                let generic = ngram_similarity_generic(n, left_cs, &right);
+                let ascii = ngram_similarity_ascii(n, left.as_bytes(), right.as_bytes())
+                    .expect("inputs are ASCII");
+                assert_eq!(
+                    generic, ascii,
+                    "mismatch for n={n} left={left:?} right={right:?}"
+                );
+            }
+        }
     }
 }
