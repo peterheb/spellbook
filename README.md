@@ -1,5 +1,11 @@
 # Spellbook
 
+> [!NOTE]
+> This is a personal fork of [helix-editor/spellbook](https://github.com/helix-editor/spellbook)
+> carrying a suggestion-performance patch (branch `suggest-ascii-fast-path`) used by
+> [Syl](https://github.com/peterheb/syl). See upstream for the real project.
+
+
 [![Crates.io](https://img.shields.io/crates/v/spellbook.svg)](https://crates.io/crates/spellbook)
 [![Documentation](https://docs.rs/spellbook/badge.svg)](https://docs.rs/spellbook)
 
